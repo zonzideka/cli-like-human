@@ -1,0 +1,6 @@
+# cli-session: dsh auto-approve patch. Only disables approval prompts; the sandbox stays at the
+# default workspace-write. Never set DSH_PERMISSION_MODE=danger-full-access.
+# Install: cp examples/dsh-auto.patch.yml ~/.cli-sessions/
+- id: approval
+  config:
+    policy: never

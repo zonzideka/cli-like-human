@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# cli-session: drive claude/codex/grok/agy TUIs in tmux like a human; registry maps session name -> native id
+# 用 tmux 像人一样驱动各家 TUI；LANG=zh* 时输出中文
+set -euo pipefail
+CS_HOME=${CLI_SESSIONS_HOME:-$HOME/.cli-sessions}
+REG=${CLI_SESSIONS_REG:-$CS_HOME/registry.json}
+LOGDIR=${CLI_LOGS:-$CS_HOME/logs}
+mkdir -p "$(dirname "$REG")" "$LOGDIR"; [ -f "$REG" ] || echo '{}' >"$REG"
+case ${LANG:-} in zh*) ZH=1;; *) ZH=;; esac
+m(){ if [ -n "$ZH" ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }   # m "english" "中文"
+die(){ echo "cli-session: $*" >&2; exit 1; }
+reg(){ python3 - "$REG" "$@" <<'PY'
+import json,sys,time
+p,op,*a=sys.argv[1:];d=json.load(open(p))
+if op=='set': d.setdefault(a[0],{})[a[1]]=a[2]
+elif op=='get': print(d.get(a[0],{}).get(a[1],'')); sys.exit()
+elif op=='list':
+  for k,v in d.items(): print(f"{k}\t{v.get('cli')}\t{v.get('id','?')}\t{v.get('dir')}\t{v.get('state','')}")
+  sys.exit()
+json.dump(d,open(p,'w'),ensure_ascii=False,indent=1)
+PY
+}
+T(){ echo "cs-$1"; }
+MARKS=$CS_HOME/marks; mkdir -p "$MARKS"
+HOOK=${CLI_SESSION_HOOK:-$(dirname "$(realpath "$0")")/cli-session-hook}
+# 只对本次 claude 会话生效的钩子（--settings 叠加，不改 ~/.claude/settings.json）
+HOOKJSON='{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"'$HOOK' start"}]}],"Stop":[{"hooks":[{"type":"command","command":"'$HOOK' done"}]}]}}'
+
+uuid(){ python3 -c 'import uuid;print(uuid.uuid4())'; }
+resume_cmd(){ local n=$1 c id; c=$(reg get "$n" cli); id=$(reg get "$n" id)
+  case $c in claude) echo "claude -r ${id:-$n}";; codex) echo "codex resume ${id:-<id>}";;
+    grok) echo "grok -r $id";; agy) echo "agy --conversation ${id:-<id>}";; esac; }
+find_id(){ # 对 codex/agy：取启动后在该目录新建的会话 id
+  local c=$1 dir=$2 since=$3
+  case $c in
+  codex) python3 - "$dir" "$since" <<'PY'
+import sqlite3,sys
+c=sqlite3.connect('file:'+__import__('os').path.expanduser('~/.codex/state_5.sqlite')+'?mode=ro',uri=True)
+r=c.execute("select id from threads where cwd=? and created_at>=? order by created_at desc limit 1",(sys.argv[1],int(sys.argv[2]))).fetchone()
+print(r[0] if r else '')
+PY
+  ;;
+  agy) find ~/.gemini/antigravity-cli/conversations -name '*.db' -newermt "@$since" -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -1 | awk '{sub(/\.db$/,"",$2);print $2}';;
+  esac; }
+cmd=${1:-}; shift || true
+case $cmd in
+start) # start <名> <claude|codex|grok|agy> [目录] [-- 额外参数]
+  n=$1 c=$2; dir=$(realpath "${3:-$PWD}"); shift 3 2>/dev/null || shift $#; [ "${1:-}" = -- ] && shift
+  tmux has-session -t "$(T "$n")" 2>/dev/null && die "$(m "session $n is already running" "会话 $n 已在运行")"
+  old=$(reg get "$n" id); id=$old
+  case $c in
+  claude) [ -n "$old" ] && run="claude -r $old" || { id=$(uuid); run="claude -n $n --session-id $id"; }
+          run="$run --settings '$HOOKJSON'";;
+  grok)   [ -n "$old" ] && run="grok -r $old"   || { id=$(uuid); run="grok -s $id"; };;
+  codex)  [ -n "$old" ] && run="codex resume $old" || run="codex"
+          run="$run -c 'notify=[\"$HOOK\",\"done\"]'";;
+  agy)    [ -n "$old" ] && run="agy --conversation $old" || run="agy";;
+  dsh) die "$(m "dsh has no TUI profile; inject DEEPSEEK_API_KEY via a secret manager, then run" "dsh 没有终端界面；用密钥管理器注入 DEEPSEEK_API_KEY 后运行"): dsh --profile headless --patch $CS_HOME/dsh-auto.patch.yml \"task\"";;
+  *) die "$(m "unknown CLI" "未知 CLI"): $c";; esac
+  extra=" $* "
+  has(){ for f in "$@"; do case $extra in *" $f "*|*" $f="*) return 0;; esac; done; return 1; }
+  auto=
+  if [ "${CS_NO_AUTO:-}" != 1 ]; then   # 自动接受但保留沙箱；CS_NO_AUTO=1 关掉
+    case $c in
+    claude) has --permission-mode || auto="--permission-mode acceptEdits"
+            has --disallowedTools --disallowed-tools --allowedTools --allowed-tools || auto="$auto --disallowedTools Bash";;
+    codex)  has -a --ask-for-approval || auto="-a never"
+            has -s --sandbox || auto="$auto -s workspace-write";;
+    grok)   has --always-approve --permission-mode || auto="--always-approve"
+            has --sandbox || auto="$auto --sandbox workspace";;
+    agy)    has --mode || auto="--mode accept-edits"
+            has --sandbox || auto="$auto --sandbox";;
+    esac
+  fi
+  case $c in codex) run="codex $auto ${run#codex}";; *) run="$run $auto";; esac
+  run="$run $*"
+  rm -f "$MARKS/$n".*
+  tmux new-session -d -s "$(T "$n")" -x 200 -y 50 -c "$dir" -e "CS_NAME=$n" -e "CLI_SESSIONS_HOME=$CS_HOME" "$run; echo '[cli-session] CLI exited'; exec bash"
+  tmux pipe-pane -t "$(T "$n")" -o "cat >> $LOGDIR/$n.tty.log"
+  reg set "$n" cli "$c"; reg set "$n" dir "$dir"; reg set "$n" since "$(date +%s)"; reg set "$n" state running
+  [ -n "$id" ] && reg set "$n" id "$id"
+  echo "$(m "started $n ($c) in $dir:" "已启动 $n ($c) 于 $dir：") $run";;
+send) # send <名> <文本|- 读 stdin>
+  n=$1; shift; f=$(mktemp); if [ "${1:-}" = - ]; then cat >"$f"; else printf '%s' "$*" >"$f"; fi
+  date +%s.%N > "$MARKS/$n.sent"
+  tmux load-buffer -b "cs-$n" "$f"; tmux paste-buffer -p -d -b "cs-$n" -t "$(T "$n")"; rm -f "$f"
+  sleep 0.5; tmux send-keys -t "$(T "$n")" Enter
+  c=$(reg get "$n" cli); if [ -z "$(reg get "$n" id)" ]; then sleep 3; id=$(find_id "$c" "$(reg get "$n" dir)" "$(reg get "$n" since)"); [ -n "$id" ] && reg set "$n" id "$id"; fi; true;;
+key) n=$1; shift; tmux send-keys -t "$(T "$n")" "$@";;   # key <名> Enter|Escape|Down|y …
+read) tmux capture-pane -p -J -t "$(T "$1")" -S "-${2:-60}";;
+wait) # wait <名> [--timeout 秒=3600] [--stable 秒=6] [--lines N=15]：先见“开始干活”再等“完成”；完成 0，超时 2，弹窗 3，会话没了 4
+  n=$1; shift; to=3600 st=6 ln=15
+  while [ $# -gt 0 ]; do case $1 in --timeout) to=$2; shift 2;; --stable) st=$2; shift 2;; --lines) ln=$2; shift 2;;
+    [0-9]*) to=$1; shift;; *) die "$(m "unknown argument" "未知参数") $1";; esac; done
+  c=$(reg get "$n" cli); t0=$SECONDS
+  sent=$(cat "$MARKS/$n.sent" 2>/dev/null || date +%s.%N)
+  case $c in claude|codex) how=hook;; *) how=idle;; esac
+  newer(){ [ -f "$MARKS/$n.$1" ] && python3 -c "import sys;sys.exit(0 if float(open('$MARKS/$n.$1').read())>$sent else 1)"; }
+  BUSY='esc to interrupt|Ctrl\+c:cancel|esc to cancel|ctrl\+c to (stop|interrupt)|Working|Thinking…|Running|Generating'
+  started=0 last= same=0 res=timeout rc=2
+  while [ $((SECONDS-t0)) -lt "$to" ]; do
+    s=$(tmux capture-pane -p -t "$(T "$n")" 2>/dev/null) || { res=gone; rc=4; break; }
+    if grep -qE 'Update now|trust this folder|Trust and continue|Press Enter to continue|I agree|Choose the text style|Do you want to|Allow .*\?|Run this command\?' <<<"$s"; then res=prompt; rc=3; break; fi
+    busy=0; grep -qiE "$BUSY" <<<"$s" && busy=1
+    [ $busy = 1 ] && started=1; newer start && started=1
+    if [ $how = hook ] && newer done; then res=done; rc=0; break; fi
+    if [ $how = idle ] && [ $started = 1 ]; then
+      if [ "$s" = "$last" ] && [ $busy = 0 ]; then same=$((same+2)); [ $same -ge "$st" ] && { res=done; rc=0; break; }; else same=0; fi
+    fi
+    last=$s; sleep 2; done
+  echo "[cli-session wait] session=$n cli=$c mode=$how result=$res started=$started elapsed=$((SECONDS-t0))s"
+  [ $res = prompt ] && m "A prompt is on screen: read it first, then answer with key (press Escape on update prompts, not Enter)" "屏幕上有确认/弹窗，先 read 看清再用 key 处理（更新提示按 Escape，不要按 Enter）"; echo
+  tmux capture-pane -p -J -t "$(T "$n")" 2>/dev/null | grep -v '^\s*$' | tail -n "$ln"
+  exit $rc;;
+list) reg list;;
+attach-hint) n=$1; echo "$(m "Live takeover:" "接管实时界面:") tmux attach -t $(T "$n")   ($(m "detach" "离开"): Ctrl-b d)"
+  echo "$(m "Or after closing, resume in" "或关掉后在") $(reg get "$n" dir): $(resume_cmd "$n")";;
+stop) n=$1; c=$(reg get "$n" cli); case $c in claude) q=/exit;; codex|grok) q=/quit;; *) q=;; esac
+  if [ -n "$q" ]; then tmux send-keys -t "$(T "$n")" -l "$q"; sleep 0.5; tmux send-keys -t "$(T "$n")" Enter; else tmux send-keys -t "$(T "$n")" C-c; sleep 0.5; tmux send-keys -t "$(T "$n")" C-c; fi
+  sleep 3; tmux kill-session -t "$(T "$n")" 2>/dev/null || true; reg set "$n" state stopped
+  echo "$(m "tmux stopped; session kept in native storage, resume with:" "已停止 tmux；会话仍在原生存储，可用:") $(resume_cmd "$n")";;
+*) sed -n '2p' "$0"; echo "$(m usage 用法): cli-session start|send|key|read|wait|list|attach-hint|stop …";;
+esac

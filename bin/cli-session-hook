@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# cli-session-hook <start|done>: completion hook for sessions started by cli-session; writes a marker file. No-op when CS_NAME is unset.
+[ -n "${CS_NAME:-}" ] || exit 0
+d=${CLI_SESSIONS_HOME:-$HOME/.cli-sessions}/marks; mkdir -p "$d"
+timeout 1 cat >/dev/null 2>&1 || true   # swallow the JSON claude passes on stdin
+date +%s.%N > "$d/$CS_NAME.$1"
+exit 0
