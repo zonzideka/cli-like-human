@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+n=${CS_NAME:-}
+[[ $n =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || exit 1
+d=${CLI_SESSIONS_MARKS_DIR:-${CLI_SESSIONS_HOME:-$HOME/.cli-sessions}/marks}
+mkdir -p "$d"
+kind=${1:-}
+case $kind in
+  sent) value=$(mktemp "$d/token.XXXXXXXX"); rm -f "$value"; value=${value##*/};;
+  start|done) value=$(cat "$d/$n.sent" 2>/dev/null || true); [ -n "$value" ] || exit 0;;
+  exit) value=${2:?missing exit status};;
+  *) exit 1;;
+esac
+tmp=$(mktemp "$d/.mark.XXXXXXXX")
+trap 'rm -f "$tmp"' EXIT
+printf '%s\n' "$value" > "$tmp"
+mv -f "$tmp" "$d/$n.$kind"

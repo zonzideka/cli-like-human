@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
-# cli-session-hook <start|done>: completion hook for sessions started by cli-session; writes a marker file. No-op when CS_NAME is unset.
+# Hook stdin is intentionally not read: not every CLI supplies a closed stream.
+set -euo pipefail
 [ -n "${CS_NAME:-}" ] || exit 0
-d=${CLI_SESSIONS_HOME:-$HOME/.cli-sessions}/marks; mkdir -p "$d"
-timeout 1 cat >/dev/null 2>&1 || true   # swallow the JSON claude passes on stdin
-date +%s.%N > "$d/$CS_NAME.$1"
-exit 0
+[[ $CS_NAME =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || exit 1
+case ${1:-} in start|done) ;; *) exit 0;; esac
+here=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)
+# Codex supplies its event as the last argument. jq is optional; never guess IDs.
+if [ "$#" -ge 2 ] && command -v jq >/dev/null; then
+  payload=${!#}
+  id=$(printf '%s' "$payload" | jq -r '."thread-id" // empty' 2>/dev/null || true)
+  if [[ $id =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    reg=${CLI_SESSIONS_REG:-${CLI_SESSIONS_HOME:-$HOME/.cli-sessions}/registry}
+    if [ -d "$reg/$CS_NAME" ]; then
+      tmp=$(mktemp "$reg/$CS_NAME/.id.XXXXXXXX")
+      printf '%s\n' "$id" > "$tmp"; mv -f "$tmp" "$reg/$CS_NAME/id"
+    fi
+  fi
+fi
+"$here/cli-session-mark" "$1"

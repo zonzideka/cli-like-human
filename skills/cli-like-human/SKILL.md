@@ -1,117 +1,53 @@
 ---
 name: cli-like-human
 description: >-
-  Use when an agent needs to drive local coding CLIs (claude / codex / grok / agy, plus headless dsh)
-  to write code, review, plan, or follow up on a task. Use them the way a human does: one named session
-  per task, in the real project directory, with the human's own config, stored only in native session
-  storage, so a human can take over at any time via tmux attach or native resume.
-  Not for building unattended batch platforms.
+  Drive local claude, codex, grok, or agy coding CLIs in named tmux sessions
+  with native persistent history, terminal inspection, completion detection,
+  and human takeover through attach or native resume.
 ---
-# Use CLIs like a human
+# Use coding CLIs like a human
 
-> 中文版：[SKILL.zh.md](SKILL.zh.md). Both versions have the same content.
+Use one named session per task. Send follow-ups and corrections to the same session. Start in the real project directory, preferably a separate git worktree for independent edits. Keep the human's HOME and native CLI configuration. Never create private substitute transcript storage or disable native persistence.
 
-Humans use agents; agents use CLIs. To a CLI, the agent *is* the human — so the agent must use it the way a human would, so that a human can pick up seamlessly later. Supports claude / codex / grok / agy, and headless-only dsh. Not for building unattended batch platforms.
+Never kill sessions or delete native history. Leave the terminal available and finish with `cli-session attach-hint NAME`. Stop only when requested, through normal CLI exit; the driver retains the pane.
 
-## Principles
-1. **One named session per task.** Follow-ups and rework go back to the same session; never open a new one. Name it `<project>-<task>-<role>`, e.g. `shop-login-fix-code`.
-2. **Real project directory + the human's config.** Start in the project directory (its worktree when writing code) so the CLI reads AGENTS.md / CLAUDE.md, slash commands and model settings itself. Don't change HOME, don't use private config dirs, don't add wrapper layers.
-3. **Native storage only.** The session is the CLI's own session file; the registry only maps "name → native id" and never copies content. Don't use `--no-session-persistence` or `codex exec --ephemeral`.
-4. **Don't close sessions; leave them for the human.** Don't delete sessions when done; keep the tmux session or exit the CLI normally (not by killing it), and hand over a takeover command.
+## Workflow
 
-## Delegate or do it yourself
-- **Delegate**: high-output work that can be verified independently — code, long documents, batch processing. The agent splits the task, writes a clear brief (goal, constraints, acceptance criteria), verifies the result and reports to the human.
-- **Do it yourself**: one- or two-step jobs. If briefing costs more than doing, don't delegate for its own sake.
-- **Always stays with the agent**: the final answer to the human, gate decisions, merges and releases that need human approval.
-- When unsure, ask: can I verify the delegated result against one clear criterion? If yes, delegate; if not, define the criterion first.
+1. Inspect `cli-session list` before creating a session. Choose a descriptive task name such as `example-fix`.
+2. Run `cli-session start NAME CLI PROJECT_DIR`, then `cli-session read NAME`. Resolve startup screens deliberately.
+3. Send a brief containing the goal, constraints, and acceptance checks: `cli-session send NAME 'TASK'`. For long text use `cli-session send NAME -` with stdin.
+4. Immediately run `cli-session wait NAME --timeout 600`. Use a background job if the host supports asynchronous command completion. A timeout does not stop work.
+5. Interpret the exit status: 0 completed turn; 2 timeout; 3 popup; 4 exited CLI or missing session; 1 command error. Read the screen and verify changes and reported checks. Completion does not prove correctness.
+6. For a popup, read before sending specific keys with `cli-session key NAME Escape` or another appropriate key sequence. Then wait again. Never blindly press Enter.
+7. Send follow-ups to the same name, serially. Hand the human the output of `cli-session attach-hint NAME`.
 
-## Choosing a mode
-- **tmux interactive (default)**: multi-turn, long tasks, or when a human may take over midway. The human can `tmux attach` to watch live.
-- **headless + resume**: single short questions, structured (JSON) output, CI-style checks. Pass the same session name/id every turn; the human can still view it later with native resume.
+## Per-CLI commands
 
-## Script `cli-session` (put it on PATH, e.g. `~/.local/bin`)
-```
-cli-session start <name> <claude|codex|grok|agy> [dir] [-- extra args]   # start TUI; resumes if name is registered
-cli-session send <name> "prompt"     # or: send <name> - (read stdin); uses load-buffer/paste-buffer
-cli-session wait <name> [--timeout s] # 0 done / 2 timeout / 3 prompt on screen / 4 session gone
-cli-session read <name> [lines=60]   # capture-pane
-cli-session key <name> Escape|Enter|Down …   # answer prompts
-cli-session list | attach-hint <name> | stop <name>   # stop = exit CLI normally, session kept
-```
-Registry: `~/.cli-sessions/registry.json` (override with `CLI_SESSIONS_HOME` / `CLI_SESSIONS_REG`); screen logs: `~/.cli-sessions/logs/<name>.tty.log` (`CLI_LOGS`). With `LANG=zh*` the script prints Chinese.
-Standard loop: `start → wait (handle prompts) → send → wait → read → send follow-ups… → attach-hint to hand over`.
+| CLI | Native start | Native resume | Driver default flags | Detection |
+| --- | --- | --- | --- | --- |
+| claude | `claude -n NAME --session-id UUID` | `claude -r ID` | `--permission-mode acceptEdits --disallowedTools Bash` | UserPromptSubmit/Stop hooks through per-session `--settings` |
+| codex | `codex` | `codex resume ID` | `-a never -s workspace-write` | Per-session `-c notify=[...]` hook |
+| grok | `grok -s UUID` | `grok -r ID` | `--always-approve --sandbox workspace` | Busy then stable idle |
+| agy | `agy` | `agy --conversation ID` | `--mode accept-edits --sandbox` | Busy then stable idle |
 
-## Command matrix (tested: claude 2.1.309 / codex 0.162.0 / grok 1.0.70 / agy 1.4.2)
-| | Named session | One-shot headless | Resume | Human's session list |
-|---|---|---|---|---|
-| claude | `claude -n <name> --session-id <uuid>` (name stored as customTitle) | `-p -n <name> --session-id <uuid> --output-format json` (returns session_id) | `claude -r <name or id>`, also with -p | `/resume` (shows names) |
-| codex | no name flag; `/rename <name>` inside the TUI | `codex exec --json -s read-only …`; first line `thread.started` carries thread_id | `codex resume <id or name>`; `codex exec resume <id or name> -` | `codex resume` picker; **exec sessions only appear with `--include-non-interactive`** |
-| grok | `grok -s <uuid>` (custom id honored) | `grok -s <uuid> -p "…" --always-approve --sandbox workspace --output-format json` | `grok -r <id>` | `grok sessions list` includes headless sessions |
-| agy | no name flag, id only | `agy -p "…" --output-format json`, returns `conversation_id` | `agy --conversation <id>` | files at `~/.gemini/antigravity-cli/conversations/<id>.db`; interactive list unverified |
+Flags are version dependent; inspect the installed CLI's help if rejected. Do not add bypass flags. Defaults aim to auto-accept within native sandbox controls; Claude's restrictions are permissions, not an OS sandbox. Configure its sandbox separately if required. Do not claim network denial or isolation without verification. agy may still ask for permission depending on its native configuration.
 
-Unverified: where grok's `-r <title>` title comes from; agy's session-list command; codex naming other than `/rename`.
+`CS_NO_AUTO=1` omits defaults. Explicit equivalent options replace their defaults. Extra arguments follow `--`; preserve identity, native persistence, sandboxing, and driver hooks. No global CLI settings are edited.
 
-## Fifth CLI: DeepSeek Harness (dsh, tested 0.2.1-rc.2)
-- `npm i -g @deepseek-ai/dsh` (developer preview; expect breaking changes).
-- Inject the key only from a secret manager (e.g. `op run`), never write it to files: `DEEPSEEK_API_KEY=op://<vault>/<item>/credential`.
-- One-shot: `dsh headless "…"` (result on stdout, diagnostics on stderr; `--json` streams events; `--session-id <id>` continues a session; `-` reads the task from stdin).
-- Interactive: `dsh tui` (`--resume <session>`); web UI `dsh web --no-open` (default 127.0.0.1:3080); automation `dsh --profile acp` (ACP stdio).
-- Unverified: session-list command; whether tui works with `cli-session`.
+Claude/grok IDs are allocated at start. Codex completion payloads provide an ID when jq is installed. agy ID discovery is manual. If the ID is missing, live attach still works; obtain the native ID from the CLI and restart after normal exit with `start --native-id ID NAME CLI DIR`. Never guess the latest session in shared storage. Do not open multiple writers for a native ID.
 
-## Auto-accept mode (on by default)
-`cli-session start` adds "auto-accept, keep sandbox" flags: file edits and commands no longer prompt, but writes are limited to the working directory (plus temp dirs each sandbox allows), and codex keeps network off. Flags you pass yourself are not duplicated; `CS_NO_AUTO=1 cli-session start …` disables the defaults. Never use sandbox-bypassing switches (codex `--dangerously-bypass-approvals-and-sandbox`/`--yolo`, claude/agy `--dangerously-skip-permissions`, grok always-approve without `--sandbox`, dsh `danger-full-access`).
+## Detection and first-run pitfalls
 
-| CLI | Interactive (cli-session default) | Headless |
-|---|---|---|
-| claude 2.1.312 | `--permission-mode acceptEdits --disallowedTools Bash` (auto-accept edits only, no Bash) | `claude -p --permission-mode acceptEdits --disallowedTools Bash "task"` |
-| codex 0.162.0 | `-a never -s workspace-write` | `codex exec -s workspace-write "task"` (exec never asks for approval) |
-| grok 1.0.70 | `--always-approve --sandbox workspace` | `grok -p "task" --always-approve --sandbox workspace` |
-| agy 1.4.10 | `--mode accept-edits --sandbox`, plus `"toolPermission": "proceed-in-sandbox"` in `~/.gemini/antigravity-cli/settings.json` | `agy -p "task" --mode accept-edits --sandbox` |
-| dsh 0.2.1-rc.2 | no TUI profile; not supported by `cli-session start` | inject `DEEPSEEK_API_KEY` via a secret manager, then `dsh --profile headless --patch ~/.cli-sessions/dsh-auto.patch.yml "task"` (patch only sets approval to never; sandbox stays workspace-write) |
+Hook-based wait requires a completion marker matching the latest dispatch. Idle wait requires an observed busy marker followed by about six seconds of unchanged screen without busy markers. Start wait immediately after send: short work can finish before busy is observed. Animations, changed wording, and busy words in output can cause timeout or incorrect idle inference. Inspect output yourself. Only one dispatcher/waiter per name is supported; overlapping turns can misattribute hooks.
 
-Sandbox tests (writing outside the work dir to `~/outside-<cli>.txt`; grok/codex/agy sandboxes all allow /tmp, so don't test with /tmp):
-- codex: `Read-only file system`, blocked. grok: `Permission denied`, blocked. agy: `Read-only file system`, blocked.
-- dsh: `Read-only file system`; the sandbox offers escalation, but approval is off so escalation is denied.
-- claude: no Bash; Write outside the work dir shows `Do you want to create …?` (wait returns 3) — a permission prompt, not a sandbox. Answer No; don't choose "always allow" for your whole HOME, and don't type `! command` as claude suggests.
-- agy `--mode auto` logged `auto mode is unavailable, falling back to default` on the test machine, so it isn't used; with `accept-edits` alone `ls` still prompts `Run this command?` until proceed-in-sandbox is set.
-- The first visit to a new directory still asks to trust it (claude/codex/agy); codex may also show an update prompt (press Escape). Handle these once with `key`.
+Theme selection, login, security notices, folder trust, telemetry consent, and update dialogs may appear on first use. Inspect the current screen and the chosen option, not an assumed cursor position. Update prompts may select installation by default; use Escape to defer. Do not enable data sharing or trust a directory without appropriate authorization. Popup detection is heuristic and only examines the screen tail.
 
-## Wake on done: `cli-session wait`
-After dispatching, run in the background: `cli-session wait <name> [--timeout s, default 3600] [--stable s, default 6] [--lines summary lines, default 15]`. It exits when the CLI finishes the turn, so the caller (an agent's background-job notification, a script, …) wakes up and reads the first line and the screen summary.
-- Exit codes: 0 done; 2 timeout; 3 confirmation/permission prompt on screen (`read` it, answer with `key`, then wait again); 4 tmux session gone.
-- First line: `[cli-session wait] session=… cli=… mode=hook|idle result=… started=0|1 elapsed=Ns`, then the last screen lines.
-- No false positives: `send` records the dispatch time; wait requires a "started" signal (hook start mark or a busy marker) and a done mark newer than dispatch.
-- Detection per CLI:
-  - claude: hook. `start` overlays UserPromptSubmit/Stop hooks for this session only via `--settings` (calling `cli-session-hook`, which writes `$CLI_SESSIONS_HOME/marks/<name>.start|.done`); `~/.claude/settings.json` is untouched.
-  - codex: hook. Started with `-c notify=["<hook>","done"]`, this session only; `~/.codex/config.toml` is untouched.
-  - grok / agy: terminal idle. After a busy marker (`esc to interrupt` / `Ctrl+c:cancel` / `Working` / `Thinking…` / `Running` …), ~6 s of unchanged screen without busy markers means done.
-  - dsh: headless only; the command exiting means done.
-- Hooks only work in sessions launched by `cli-session start` (via tmux env `CS_NAME`); stop and re-start older sessions to get hooks.
-- For idle-detected CLIs, if the work finishes before wait starts, no start signal is seen and wait runs to timeout — start wait right after dispatch.
-- Fallback: a machine restart kills a running wait. For long jobs, schedule a fallback check (`cli-session list` + `read`).
-- Tested (auto-accept mode): claude and codex via hook, exit 0; grok idle 16 s, exit 0; agy idle 23 s, exit 0; dsh headless 11 s, exit 0. Timeout path tested on claude and grok (exit 2).
+The driver exposes `start`, `send`, `key`, `read`, `wait`, `list`, `attach-hint`, and `stop`. `stop` requests `/exit` for claude and `/quit` for codex/grok; for agy attach and exit normally. It never kills tmux. Inspect the pane to confirm exit before restarting. Do not send text until the CLI is ready.
 
-## Handing over
-`cli-session attach-hint <name>` prints two lines:
-- Live takeover: `tmux attach -t cs-<name>` (detach with Ctrl-b d)
-- After closing, resume in the project dir: `claude -r <name>` / `codex resume <id or name>` / `grok -r <id>` / `agy --conversation <id>`
+## State and handoff
 
-## Shared rules
-- Follow the project's own branch and commit conventions; paste them into the prompt when delegating.
-- Write code in a separate git worktree (grok: `-w <name>`), never directly on the main branch.
-- Auto-accept is on by default with each CLI's sandbox kept (see "Auto-accept mode"); for read-only review use codex `-s read-only` or claude `--permission-mode plan`. Use `CS_NO_AUTO=1` for per-action confirmation.
-- Secrets only through a secret manager (e.g. `op run` + `op://` references), never in prompts or logs.
-- Put a total time limit on every call; write logs to a fixed directory.
-- Merges, releases and outbound messages still need human approval. Nobody reviews their own work.
+`CLI_SESSIONS_HOME` defaults to `$HOME/.cli-sessions`. `CLI_SESSIONS_REG` defaults to its `registry` directory; it holds metadata and launch arguments, not a transcript copy. `CLI_SESSIONS_MARKS_DIR` defaults to its `marks` directory. `CLI_LOGS` independently defaults to `$HOME/.cli-sessions/logs` and contains raw terminal output. Use consistent absolute overrides. Optional `--bot LABEL` or `CS_BOT` is only a metadata label.
 
-## Pitfalls (tested)
-- **First-run prompts**: claude shows theme, security notice, then trust-folder — the cursor defaults to "No, exit", so send `Down Enter`. codex's trust prompt defaults to "Trust and continue". agy shows theme, a **data-sharing consent that is checked by default** (uncheck, then Done), and trust-folder. grok shows "Help improve Grok", off by default.
-- **codex update prompt**: "Update now" is preselected (runs a global npm install) — press `Escape`, never Enter.
-- **codex write lock**: the codex TUI holds the session write lock through a background app-server daemon that survives exiting the TUI, so `codex exec resume` fails with `already has an active writer`; interactive `codex resume <id>` works. To resume headless you must `codex app-server daemon stop` (affects other codex sessions — ask the human first). Stick to one mode per codex session.
-- Send long text with `load-buffer` + `paste-buffer -p` (bracketed paste) and a separate Enter; don't type it with `send-keys`.
-- Use a 200×50 window to avoid wrap misdetection; `capture-pane -J` joins wrapped lines.
-- In headless mode put the prompt on stdin or last so variadic flags (e.g. `--add-dir`) don't swallow it; codex exec waits on stdin when none is given — add `</dev/null` or use `-`.
-- claude's TUI suggests tmux `focus-events off`; harmless.
+Keep secrets out of prompts, arguments, and logs; use your secret manager's environment injection. Existing tmux servers may have stale environments. Review logs as sensitive data. Do not change shared services to clear native session locks without checking other sessions. Follow project rules and obtain human authorization for merges, releases, and outbound actions.
 
-## References
-- [awslabs/cli-agent-orchestrator](https://github.com/awslabs/cli-agent-orchestrator): another approach to orchestrating multiple CLIs, aimed at automated orchestration; by default it uses no-prompt flags and per-terminal config dirs for some CLIs. This skill focuses on human takeover instead; its idle-marker approach was a useful reference.
+The final handoff includes the task status, verification results, unresolved limitations, and the attach/resume instructions from `attach-hint`. Detach with Ctrl-b then d. Preserve the named session for the next turn.
