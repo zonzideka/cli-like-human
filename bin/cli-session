@@ -55,6 +55,7 @@ case $cmd in
   start|send|key|read|wait|list|attach-hint|stop|set-id) ;;
   *) usage; exit 1;;
 esac
+command -v python3 >/dev/null || fail 'python3 is required for native completion tracking'
 command -v tmux >/dev/null || fail 'tmux is required'
 case $cmd in
 start)
@@ -180,10 +181,21 @@ case $cmd in
 send)
   [ $# -gt 0 ] || fail 'missing text'
   alive && [ ! -f "$MARKS/$n.exit" ] || fail 'CLI has exited'
+  # Refuse overlapping dispatches instead of attributing the old completion to a new turn.
+  if [ -f "$MARKS/$n.sent" ]; then
+    case $(get cli) in
+      agy|grok)
+        prior=$("$HERE/cli-session-native" status "$n")
+        case $prior in busy|pending) fail 'previous turn is still pending; read/wait or resolve its prompt before sending';; esac;;
+      codex|claude)
+        [ "$(cat "$MARKS/$n.sent")" = "$(cat "$MARKS/$n.done" 2>/dev/null || true)" ] || fail 'previous turn is still pending; read/wait before sending';;
+    esac
+  fi
   f=$(mktemp "$REG/$n/input.XXXXXXXX"); trap 'rm -f "$f"' EXIT
   if [ "$1" = - ]; then cat > "$f"; else printf '%s' "$*" > "$f"; fi
   # Serialize turns at the caller: a new dispatch invalidates previous done marks.
   mark sent
+  CS_NAME=$n CLI_SESSIONS_HOME=$ROOT CLI_SESSIONS_REG=$REG CLI_SESSIONS_MARKS_DIR=$MARKS "$HERE/cli-session-native" prepare "$n"
   tmux load-buffer -b "cs-$n" "$f"
   tmux paste-buffer -p -d -b "cs-$n" -t "=cs-$n:"
   sleep 1
@@ -206,6 +218,12 @@ wait)
     [ "$current" = "$token" ] || fail 'another dispatch replaced this turn'
     if [ -f "$MARKS/$n.exit" ]; then rc=4; result=gone; break; fi
     if [ -n "$token" ] && [ "$(cat "$MARKS/$n.done" 2>/dev/null || true)" = "$token" ] && [ "$mode" = hook ]; then rc=0; result='done'; break; fi
+    native=$(CLI_SESSIONS_HOME=$ROOT CLI_SESSIONS_REG=$REG CLI_SESSIONS_MARKS_DIR=$MARKS "$HERE/cli-session-native" status "$n")
+    case $native in
+      done) mode=native; rc=0; result=done; break;;
+      failed) mode=native; rc=5; result=failed; break;;
+      pending|busy) mode=native;;
+    esac
     if printf '%s\n' "$screen" | tail -n 20 | chrome_strip "$c" | grep -qiE "$PROMPT_RE"; then rc=3; result=prompt; break; fi
     busy=0
     printf '%s\n' "$screen" | tail -n 12 | grep -qiE 'esc to interrupt|ctrl\+c:cancel|esc to cancel|ctrl\+c to (stop|interrupt)|Waiting for response|Working|Thinking|Running|Generating' && busy=1
@@ -239,8 +257,9 @@ set-id)
 stop)
   alive || fail 'session is gone'
   [ ! -f "$MARKS/$n.exit" ] || { printf 'CLI already exited; pane and native history retained.\n'; exit 0; }
-  case $(get cli) in claude) quit=/exit;; codex|grok) quit=/quit;; *) fail 'use attach-hint and exit agy normally; no automatic exit command configured';; esac
+  case $(get cli) in claude) quit=/exit;; codex|grok|agy) quit=/quit;; *) fail 'unsupported CLI';; esac
   tmux send-keys -t "=cs-$n:" -l "$quit"
+  sleep 1
   tmux send-keys -t "=cs-$n:" Enter
   printf 'Requested normal exit. Check read; pane and native history are retained.\n';;
 *) usage; exit 1;;

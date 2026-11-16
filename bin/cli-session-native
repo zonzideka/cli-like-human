@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Read native completion metadata for one exact tmux/CLI session; never transcripts."""
+import datetime
+import json
+import os
+import pathlib
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+
+
+def atomic(path, value):
+    tmp = path.with_name(path.name + '.tmp.' + str(os.getpid()))
+    tmp.write_text(value)
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def agy_id(name, home):
+    """Bind by the pane's descendant process holding the native presence lock."""
+    try:
+        root = int(subprocess.check_output(
+            ['tmux', 'list-panes', '-t', '=cs-' + name + ':', '-F', '#{pane_pid}'],
+            stderr=subprocess.DEVNULL, text=True).strip())
+        parents = {}
+        for p in pathlib.Path('/proc').glob('[0-9]*'):
+            try:
+                status = (p / 'status').read_text()
+                parents[int(p.name)] = int(next(l.split()[1] for l in status.splitlines() if l.startswith('PPid:')))
+            except (OSError, StopIteration, ValueError):
+                continue
+        descendants = {root}
+        while True:
+            more = {pid for pid, parent in parents.items() if parent in descendants}
+            if more <= descendants:
+                break
+            descendants |= more
+        prefix = home / '.gemini/antigravity-cli/presence'
+        ids = set()
+        for pid in descendants:
+            for fd in pathlib.Path('/proc', str(pid), 'fd').glob('*'):
+                try:
+                    target = fd.readlink()
+                    if target.parent == prefix and target.suffix == '.lock':
+                        ids.add(target.stem)
+                except OSError:
+                    pass
+        return next(iter(ids)) if len(ids) == 1 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def grok_state(path, offset):
+    if not path.exists():
+        return 'pending'
+    if path.stat().st_size < offset:
+        return 'unknown'
+    active = False
+    result = 'pending'
+    with path.open('rb') as f:
+        f.seek(offset)
+        for line in f:
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if event.get('type') == 'turn_started':
+                active, result = True, 'busy'
+            elif active and event.get('type') == 'turn_ended':
+                result = 'done' if event.get('outcome') == 'completed' else 'failed'
+                active = False
+    return result
+
+
+def agy_state(db_path, native_id, sent_at):
+    if not db_path.exists():
+        return 'unknown'
+    if not native_id:
+        return 'pending' if sys.platform == 'linux' else 'unknown'
+    try:
+        with sqlite3.connect(db_path.as_uri() + '?mode=ro', uri=True, timeout=1) as db:
+            row = db.execute('SELECT status, not_fully_idle, last_user_input_time FROM conversation_summaries WHERE conversation_id=?', (native_id,)).fetchone()
+        if not row:
+            return 'pending'
+        stamp = datetime.datetime.fromisoformat(row[2]).timestamp()
+        if stamp < sent_at:
+            return 'pending'
+        if row[0] == 'CASCADE_RUN_STATUS_IDLE' and not row[1]:
+            return 'done'
+        return 'busy'
+    except (sqlite3.Error, ValueError, TypeError):
+        return 'unknown'
+
+
+def main():
+    operation, name = sys.argv[1:3]
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]*', name):
+        raise ValueError('invalid session name')
+    home = pathlib.Path.home()
+    root = pathlib.Path(os.environ.get('CLI_SESSIONS_HOME', home / '.cli-sessions'))
+    reg = pathlib.Path(os.environ.get('CLI_SESSIONS_REG', root / 'registry')) / name
+    marks = pathlib.Path(os.environ.get('CLI_SESSIONS_MARKS_DIR', root / 'marks'))
+    c = (reg / 'cli').read_text().strip()
+    dispatch_path = marks / (name + '.native.json')
+    token_path = marks / (name + '.sent')
+    token = token_path.read_text().strip() if token_path.exists() else ''
+    native_id = (reg / 'id').read_text().strip()
+    if c == 'agy':
+        bound = agy_id(name, home)
+        if bound:
+            if native_id and native_id != bound:
+                print('unknown')
+                return
+            native_id = bound
+            atomic(reg / 'id', native_id + '\n')
+    event_path = None
+    if c == 'grok' and native_id:
+        directory = (reg / 'dir').read_text().strip()
+        event_path = home / '.grok/sessions' / urllib.parse.quote(directory, safe='') / native_id / 'events.jsonl'
+    if operation == 'prepare':
+        data = {'token': token, 'sent_at': time.time(), 'offset': event_path.stat().st_size if event_path and event_path.exists() else 0}
+        atomic(dispatch_path, json.dumps(data) + '\n')
+        return
+    if operation == 'bind':
+        print(native_id or 'unknown')
+        return
+    if not dispatch_path.exists() or not token:
+        print('unknown')
+        return
+    data = json.loads(dispatch_path.read_text())
+    if data['token'] != token:
+        print('unknown')
+        return
+    if c == 'grok' and event_path:
+        print(grok_state(event_path, data['offset']))
+    elif c == 'agy':
+        print(agy_state(home / '.gemini/antigravity-cli/conversation_summaries.db', native_id, data['sent_at']))
+    else:
+        print('unknown')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError):
+        print('unknown')
