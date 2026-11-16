@@ -21,6 +21,18 @@ Never kill sessions or delete native history. Leave the terminal available and f
 6. For a popup, read before sending specific keys with `cli-session key NAME Escape` or another appropriate key sequence. Then wait again. Never blindly press Enter.
 7. Send follow-ups to the same name, serially. Hand the human the output of `cli-session attach-hint NAME`.
 
+If the driver is not on `PATH`, prepend its directory for every call rather than relying on an earlier shell: `export PATH="$HOME/.local/bin:$PATH"`. Each command runs in a fresh shell, so this must be repeated or made absolute. Prefer the absolute path when a wrapper would otherwise be shadowed.
+
+## First-run screens: expect three, in this order
+
+A fresh agy shows theme, consent, then folder trust. Each is a separate screen and the cursor does not start where you expect:
+
+- Theme: the default (`terminal`) is preselected; Enter confirms.
+- Consent: the data-sharing checkbox is **checked by default**. Uncheck it (Space) unless the human authorized sharing. Then Tab walks to `Previous` **before** `Done`, so reaching `Done` takes two Tabs, not one. A single Tab plus Enter silently returns you to the theme screen and the loop repeats.
+- Trust: only accept a directory the human designated for this task.
+
+Never assume "the option I want is one Tab away". Read the rendered focus marker (`>`) after every key, then confirm. grok shows a persistent `Help improve Grok` opt-in banner: it is chrome, not a modal. Leave it alone; it does not block input.
+
 ## Per-CLI commands
 
 | CLI | Native start | Native resume | Driver default flags | Detection |
@@ -34,15 +46,19 @@ Flags are version dependent; inspect the installed CLI's help if rejected. Do no
 
 `CS_NO_AUTO=1` omits defaults. Explicit equivalent options replace their defaults. Extra arguments follow `--`; preserve identity, native persistence, sandboxing, and driver hooks. No global CLI settings are edited.
 
-Claude/grok IDs are allocated at start. Codex completion payloads provide an ID when jq is installed. agy ID discovery is manual. If the ID is missing, live attach still works; obtain the native ID from the CLI and restart after normal exit with `start --native-id ID NAME CLI DIR`. Never guess the latest session in shared storage. Do not open multiple writers for a native ID.
+**grok on Linux needs bubblewrap.** Its `workspace` and `read-only` profiles shell out to `bwrap`; when it is missing the CLI aborts during startup with `bwrap exec failed` and leaves a dead pane. The driver now refuses this combination up front. Install `bubblewrap`, or start with `CS_NO_AUTO=1` — but understand that this drops the sandbox, so treat it as a diagnostics-only path and do not send work that touches files or the network.
+
+Claude/grok IDs are allocated at start. Codex completion payloads provide an ID when jq is installed. agy ID discovery is manual. If the ID is missing, live attach still works; obtain the native ID from the CLI and restart after normal exit with `start --native-id ID NAME CLI DIR`. Never guess the latest session in shared storage. Do not open multiple writers for a native ID. When the CLI shows you an ID and you would rather not restart, record it with `cli-session set-id NAME ID`; `attach-hint` then prints a working resume command.
 
 ## Detection and first-run pitfalls
 
 Hook-based wait requires a completion marker matching the latest dispatch. Idle wait requires an observed busy marker followed by about six seconds of unchanged screen without busy markers. Start wait immediately after send: short work can finish before busy is observed. Animations, changed wording, and busy words in output can cause timeout or incorrect idle inference. Inspect output yourself. Only one dispatcher/waiter per name is supported; overlapping turns can misattribute hooks.
 
+Treat `wait`'s exit code as a hint, not a verdict. Idle-mode CLIs (grok, agy) can report a popup or a timeout while the turn actually finished, because detection reads only the screen tail and matches fixed wording. When `wait` returns 3 or 2, run `cli-session read NAME` and confirm from the transcript before sending keys: a stray Escape can cancel real work. A screen whose contents stopped changing but whose timer stopped advancing is usually waiting on a dialog, not thinking.
+
 Theme selection, login, security notices, folder trust, telemetry consent, and update dialogs may appear on first use. Inspect the current screen and the chosen option, not an assumed cursor position. Update prompts may select installation by default; use Escape to defer. Do not enable data sharing or trust a directory without appropriate authorization. Popup detection is heuristic and only examines the screen tail.
 
-The driver exposes `start`, `send`, `key`, `read`, `wait`, `list`, `attach-hint`, and `stop`. `stop` requests `/exit` for claude and `/quit` for codex/grok; for agy attach and exit normally. It never kills tmux. Inspect the pane to confirm exit before restarting. Do not send text until the CLI is ready.
+The driver exposes `start`, `send`, `key`, `read`, `wait`, `list`, `attach-hint`, `set-id`, and `stop`. `stop` requests `/exit` for claude and `/quit` for codex/grok; for agy attach and exit normally. It never kills tmux. Inspect the pane to confirm exit before restarting. Do not send text until the CLI is ready.
 
 ## State and handoff
 

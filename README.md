@@ -8,6 +8,7 @@ One task gets one name and a real project directory. The driver uses your existi
 
 - Bash 3.2 or later, tmux with `new-session -c`, `respawn-pane -c`, and bracketed `paste-buffer -p` support, and standard Linux/macOS utilities.
 - At least one supported coding CLI installed, authenticated, and available on `PATH`.
+- For `grok` on Linux: `bubblewrap` (`bwrap`). Its `workspace` and `read-only` sandbox profiles cannot start without it; `start` now refuses that combination instead of leaving a dead pane.
 - Optional `jq`: captures the Codex native ID from completion events. Without it, supply the ID explicitly for native resume.
 
 No Python dependency. Actual CLI flag compatibility, hook support, and sandbox behavior depend on the installed CLI version. Linux/macOS live CLI integration and macOS Bash 3.2 have not been verified for this release; see limitations below.
@@ -53,6 +54,7 @@ Handle `wait` exit codes explicitly in scripts that use `set -e`. Read the scree
 | `list` | Print registry names, CLI, native ID, optional label, and directory. |
 | `attach-hint NAME` | Print attach and native resume instructions. Detach with Ctrl-b then d. |
 | `stop NAME` | Request normal exit (`/exit` for claude, `/quit` for codex/grok). Does not kill tmux or delete history. For agy, attach and exit normally. |
+| `set-id NAME ID` | Record a native session ID the CLI reported on screen, so `attach-hint` can print a resume command without a restart. The driver never guesses IDs from shared storage. |
 
 Names and optional `--bot` labels accept letters, digits, underscores, and hyphens, beginning with a letter or digit. The label is metadata only. Reusing a registered name with another directory or CLI is rejected. A retained exited pane can be restarted with `start`; a live pane must be reused through `send` or attach.
 

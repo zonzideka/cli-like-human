@@ -34,14 +34,25 @@ Usage: cli-session start [--bot LABEL] [--native-id ID] NAME CLI [DIR] [-- CLI_A
        cli-session key NAME KEY...
        cli-session read NAME [LINES]
        cli-session wait NAME [--timeout SECONDS] [--stable SECONDS] [--lines N]
-       cli-session list | attach-hint NAME | stop NAME
+       cli-session list | attach-hint NAME | stop NAME | set-id NAME ID
 CLI: claude, codex, grok, agy. stop requests normal exit; it never kills tmux.
+set-id records a native session ID you read from the CLI, so resume works later.
 HELP
+}
+# Confirmation prompts are modals. Persistent banner chrome must not match here:
+# a banner stays on screen forever and would pin every wait to result=prompt.
+PROMPT_RE='Update now|trust this folder|trust.*directory|Trust and continue|Press Enter to continue|I agree|Choose.*theme|Choose the text style|Do you want to|Allow .*\?|Run this command\?|data\.sharing'
+# Strip known persistent per-CLI chrome before prompt matching.
+chrome_strip() {
+  case $1 in
+    grok) grep -v -e 'Help improve' -e 'Off by default\. Opt-in' -e 'Read Terms and Privacy Policy';;
+    *) cat;;
+  esac
 }
 cmd=${1:-help}; [ $# -eq 0 ] || shift
 case $cmd in
   help|--help|-h) usage; exit 0;;
-  start|send|key|read|wait|list|attach-hint|stop) ;;
+  start|send|key|read|wait|list|attach-hint|stop|set-id) ;;
   *) usage; exit 1;;
 esac
 command -v tmux >/dev/null || fail 'tmux is required'
@@ -99,6 +110,17 @@ start)
     esac
   fi
   args=("$c" "${auto[@]}")
+  # grok's sandbox profiles shell out to bubblewrap on Linux. Without it the CLI
+  # exits during startup, which is confusing to diagnose from a dead pane.
+  if [ "$c" = grok ]; then
+    for arg in "${auto[@]}"; do
+      if [ "$arg" = --sandbox ]; then
+        if [ "$(uname -s)" = Linux ] && ! command -v bwrap >/dev/null; then
+          fail 'grok needs bubblewrap on Linux: install it (apt install -y bubblewrap) or set CS_NO_AUTO=1 to start without the driver sandbox default'
+        fi
+      fi
+    done
+  fi
   hook=$HERE/cli-session-hook
   case $c in
     claude)
@@ -184,9 +206,9 @@ wait)
     [ "$current" = "$token" ] || fail 'another dispatch replaced this turn'
     if [ -f "$MARKS/$n.exit" ]; then rc=4; result=gone; break; fi
     if [ -n "$token" ] && [ "$(cat "$MARKS/$n.done" 2>/dev/null || true)" = "$token" ] && [ "$mode" = hook ]; then rc=0; result='done'; break; fi
-    if printf '%s\n' "$screen" | tail -n 20 | grep -qiE 'Update now|trust this folder|trust.*directory|Trust and continue|Press Enter to continue|I agree|Choose.*theme|Choose the text style|Do you want to|Allow .*\?|Run this command\?|data.sharing|Help improve'; then rc=3; result=prompt; break; fi
+    if printf '%s\n' "$screen" | tail -n 20 | chrome_strip "$c" | grep -qiE "$PROMPT_RE"; then rc=3; result=prompt; break; fi
     busy=0
-    printf '%s\n' "$screen" | tail -n 12 | grep -qiE 'esc to interrupt|ctrl\+c:cancel|esc to cancel|ctrl\+c to (stop|interrupt)|Working|Thinking|Running|Generating' && busy=1
+    printf '%s\n' "$screen" | tail -n 12 | grep -qiE 'esc to interrupt|ctrl\+c:cancel|esc to cancel|ctrl\+c to (stop|interrupt)|Waiting for response|Working|Thinking|Running|Generating' && busy=1
     [ "$busy" = 0 ] || started=1
     if [ "$mode" = idle ] && [ -n "$token" ] && [ "$started" = 1 ] && [ "$busy" = 0 ] && [ "$screen" = "$last" ]; then
       same=$((same+1)); if [ "$same" -ge "$stable" ]; then rc=0; result='done'; break; fi
@@ -199,11 +221,21 @@ wait)
 attach-hint)
   printf 'Attach: tmux attach -t %q\nDetach: Ctrl-b d\n' "cs-$n"
   id=$(get id); c=$(get cli)
-  if [ -z "$id" ]; then printf 'Native ID unknown: use the CLI session picker and restart with --native-id ID.\n'; else
+  if [ -z "$id" ]; then
+    printf 'Native ID unknown: use the CLI session picker and restart with --native-id ID.\n'
+    printf 'If the CLI exposes an ID on screen, record it without restarting: cli-session set-id %s ID\n' "$n"
+  else
     printf 'Resume after normal exit: cd %q && ' "$(get dir)"
     case $c in claude) printf 'claude -r';; codex) printf 'codex resume';; grok) printf 'grok -r';; agy) printf 'agy --conversation';; esac
     printf ' %q\n' "$id"
   fi;;
+set-id)
+  # Record a native session ID the CLI reported, so resume survives a later restart.
+  # Never guessed from shared storage: the caller supplies the observed value.
+  [ $# -ge 1 ] || fail 'missing native ID'
+  valid "$1"
+  put id "$1"
+  printf 'Recorded native ID for %s. Verify with attach-hint %s\n' "$n" "$n";;
 stop)
   alive || fail 'session is gone'
   [ ! -f "$MARKS/$n.exit" ] || { printf 'CLI already exited; pane and native history retained.\n'; exit 0; }
