@@ -10,7 +10,7 @@ One task gets one name and a real project directory. The driver uses your existi
 - At least one supported coding CLI installed, authenticated, and available on `PATH`.
 - Optional `jq`: captures the Codex native ID from completion events. Without it, supply the ID explicitly for native resume.
 
-No Python dependency. Actual CLI flag compatibility, hook support, and sandbox behavior depend on the installed CLI version. Linux/macOS live CLI integration and macOS Bash 3.2 have not been verified for this release; see limitations below.
+No Python dependency. Actual CLI flag compatibility, hook support, and sandbox behavior depend on the installed CLI version. Linux/macOS live CLI integration and macOS Bash 3.2 have not been verified for this release; stall and death detection have only been exercised by fake-CLI smoke tests. See limitations below.
 
 ## Install
 
@@ -49,14 +49,43 @@ Handle `wait` exit codes explicitly in scripts that use `set -e`. Read the scree
 | `send NAME TEXT...` | Bracketed paste followed by Enter; use `send NAME -` for stdin. |
 | `key NAME KEY...` | Send tmux keys such as `Escape`, `Down`, `Enter`, or `C-c`. |
 | `read NAME [LINES]` | Capture the pane with joined wrapped lines; default history depth 60. |
-| `wait NAME [--timeout S] [--stable S] [--lines N]` | Wait for completion; defaults: 3600 seconds, 6 stable seconds, 15 summary lines. Positive integers only. |
-| `list` | Print registry names, CLI, native ID, optional label, and directory. |
+| `wait NAME [--timeout S] [--stable S] [--lines N] [--stall S] [--artifact PATH]` | Wait for completion; defaults: 3600 seconds, 6 stable seconds, 15 summary lines. Positive integers only; `--stall` allows 0 (off, the default). |
+| `status NAME [--stall S] [--artifact PATH] [--lines N]` | One-shot health probe; never sends keys. Defaults: 300 stall seconds, 15 screen lines (`--lines 0` prints only the first line). |
+| `list` | Print registry names, CLI, native ID, optional label, directory, then appended STATE, TURN, and LOG_AGE columns. |
 | `attach-hint NAME` | Print attach and native resume instructions. Detach with Ctrl-b then d. |
 | `stop NAME` | Request normal exit (`/exit` for claude, `/quit` for codex/grok). Does not kill tmux or delete history. For agy, attach and exit normally. |
+| `version` / `--version` | Print `cli-session 0.2.0`; works without tmux. |
 
 Names and optional `--bot` labels accept letters, digits, underscores, and hyphens, beginning with a letter or digit. The label is metadata only. Reusing a registered name with another directory or CLI is rejected. A retained exited pane can be restarted with `start`; a live pane must be reused through `send` or attach.
 
-`wait` returns **0** for hook completion or inferred idle, **2** for timeout, **3** for a detected confirmation/popup, and **4** for an exited CLI or missing session. Usage, dispatch replacement, and other errors return **1**. A timeout leaves the task running. Success reports turn completion, not task correctness or successful tests.
+`wait` returns **0** for hook completion or inferred idle, **2** for timeout, **3** for a detected confirmation/popup, **4** for an exited CLI (including `dead`, a launcher killed without an exit marker) or a missing session, and **5** for `stalled` (alive but no activity for `--stall` seconds; only when `--stall` is passed). `status` uses the same family plus 5, and adds `active` for 2. Usage, dispatch replacement, and other errors return **1**. `wait --stall` defaults to 0 (off); `status --stall` defaults to 300. A timeout leaves the task running. Success reports turn completion, not task correctness or successful tests.
+
+## Patrol
+
+`wait` blocks until there is a conclusion; `status` answers immediately for a patrol. The driver never sends keys from `status`, never kills or restarts anything, and never runs a resident daemon. The caller schedules patrols with the host's timer or a background job.
+
+For driver sessions, iterate the appended columns and probe only pending turns:
+
+```bash
+cli-session list | tail -n +2 | while IFS=$'\t' read -r name cli native label dir state turn log_age; do
+  [ "$turn" = pending ] || continue
+  cli-session status "$name" --lines 0
+done
+```
+
+On `stalled`/`dead`/`exited`, read the screen and the log tail before reporting to the human.
+
+For a process you started yourself (not through `cli-session`), record its PID, start time, log path, and expected artifact path, and wrap it so the exit code survives: `cmd >LOG 2>&1; echo $? >LOG.rc`. Each check covers four things:
+
+```bash
+kill -0 "$pid" 2>/dev/null && [ "$(ps -o stat= -p "$pid" | tr -d ' ')" != Z ] || echo "not running: $pid"
+[ -f "$log.rc" ] && printf 'finished rc=%s\n' "$(cat "$log.rc")"
+size=$(wc -c < "$log" 2>/dev/null | tr -d ' ')
+mt=$(stat -c %Y -- "$log" 2>/dev/null || stat -f %m -- "$log" 2>/dev/null || true)
+# Compare size/mt with the previous patrol for both the log and the artifact.
+```
+
+A process that is gone with no `.rc` file is a silent death: report immediately with the log tail. The cadence is the same as in SKILL.md: first check within 60-120 s of start, then every ≤5 min or one third of the stall threshold (shorter wins), and once more before each report to the human. Stop patrolling once a terminal state has been reported. See SKILL.md for the full patrol and reporting rules.
 
 ## CLI defaults and native IDs
 
@@ -80,7 +109,8 @@ Claude and grok receive generated UUIDs. Codex IDs are captured from the complet
 | `CLI_SESSIONS_HOME` | `$HOME/.cli-sessions`; driver state root |
 | `CLI_SESSIONS_REG` | `$CLI_SESSIONS_HOME/registry`; directory of per-name metadata files and quoted launchers, not JSON |
 | `CLI_LOGS` | `$HOME/.cli-sessions/logs`; raw terminal logs, independent of the state-root override |
-| `CLI_SESSIONS_MARKS_DIR` | `$CLI_SESSIONS_HOME/marks`; atomic turn/exit markers |
+| `CLI_SESSIONS_MARKS_DIR` | `$CLI_SESSIONS_HOME/marks`; atomic turn/exit markers plus `NAME.screen`, the screen-change timestamp used by `status` |
+| `$CLI_SESSIONS_HOME/waivers/` | Local secret-rule waiver records; the driver never reads or executes them, see SKILL.md |
 | `CS_BOT` | Optional label; `--bot` takes precedence |
 | `CS_NO_AUTO` | Set to `1` to omit automatic permission flags |
 
@@ -93,10 +123,18 @@ Use consistent configuration for every invocation. Paths may contain spaces, but
 - Serialize commands per session. Only one turn and waiter should be active per name; simultaneous starts/sends are unsupported. Hook markers correlate to the latest dispatch, so late hooks from overlapping turns can mislead a waiter.
 - `send` cannot prove the foreground program is ready. Read first; do not use extra arguments that exit into a shell. The launcher exits when the CLI exits and the pane remains visible; it never falls back to an interactive shell.
 - Idle detection is heuristic: it must observe a busy marker, then an unchanged screen without busy markers. Start waiting immediately after send. Very fast work, animated interfaces, text containing busy words, changed UI wording, and popups outside the inspected screen tail can defeat detection. Missing hooks time out; there is no silent idle fallback for claude/codex.
+- Stall detection is heuristic too. Without `--artifact`, a continuously animated screen counts as activity and the turn will time out rather than be called stalled; pass an artifact whose mtime represents real progress to override this.
+- `status` never infers completion for an idle-mode CLI. A quiet session with an unfinished dispatch is reported as `stalled` with `note=unproven-completion`; read the screen before deciding.
+- Liveness checks the pane and its exit marker. A CLI child process stuck in `T` (stopped) state is out of scope: the pane can still look alive.
+- Patrolling is the caller's responsibility. The driver has no daemon, does not auto-restart or auto-kill, and sends no notifications.
 - First-run theme, consent, directory trust, login, and update screens require inspection. An update dialog may preselect installation: prefer Escape to defer. Do not rely on fixed cursor positions across CLI versions.
 - Native resume can fail while another writer holds the session. Do not stop shared background services to clear a lock without checking other sessions.
 - `stop` merely types the normal exit command; it may fail if the CLI is busy or showing a modal. Inspect the pane. The driver never kills sessions; retained dead panes continue to occupy their tmux names.
 - No live CLI, authentication, sandbox enforcement, or cross-version integration claims are made. Local fake-CLI checks exercise the driver, not vendor implementations. Log rotation, concurrent registry access, reboot recovery of live terminals, and automatic agy ID discovery are not implemented.
+
+## Development
+
+`tests/smoke.sh` runs fake-CLI smoke tests against an isolated tmux server (its own `TMUX_TMPDIR`), so it does not touch your sessions or `~/.cli-sessions`. Run it from a checkout with `bash tests/smoke.sh`; pass scenario names to run a subset, for example `bash tests/smoke.sh S1`. It requires tmux; `shellcheck` is used when installed.
 
 ## License
 
