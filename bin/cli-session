@@ -57,6 +57,7 @@ Usage: cli-session start [--bot LABEL] [--native-id ID] NAME CLI [DIR] [-- CLI_A
        cli-session key NAME KEY...
        cli-session read NAME [LINES]
        cli-session wait NAME [--timeout SECONDS] [--stable SECONDS] [--lines N] [--stall SECONDS] [--artifact PATH]
+       cli-session status NAME [--stall SECONDS] [--artifact PATH] [--lines N]
        cli-session list | attach-hint NAME | stop NAME
 CLI: claude, codex, grok, agy. stop requests normal exit; it never kills tmux.
 HELP
@@ -64,7 +65,7 @@ HELP
 cmd=${1:-help}; [ $# -eq 0 ] || shift
 case $cmd in
   help|--help|-h) usage; exit 0;;
-  start|send|key|read|wait|list|attach-hint|stop) ;;
+  start|send|key|read|wait|status|list|attach-hint|stop) ;;
   *) usage; exit 1;;
 esac
 command -v tmux >/dev/null || fail 'tmux is required'
@@ -164,8 +165,21 @@ start)
   printf 'Started %s (%s). Use cli-session read %s before sending.\n' "$n" "$c" "$n"
   exit 0;;
 list)
-  printf 'NAME\tCLI\tNATIVE_ID\tLABEL\tDIRECTORY\n'
-  for entry in "$REG"/*; do [ -d "$entry" ] || continue; n=${entry##*/}; printf '%s\t%s\t%s\t%s\t%s\n' "$n" "$(get cli)" "$(get id)" "$(get bot)" "$(get dir)"; done
+  printf 'NAME\tCLI\tNATIVE_ID\tLABEL\tDIRECTORY\tSTATE\tTURN\tLOG_AGE\n'
+  for entry in "$REG"/*; do
+    [ -d "$entry" ] || continue
+    n=${entry##*/}; lv=$(liveness); state=$lv
+    case $lv in
+      exited\ *) state="exited:${lv#exited }";;
+      dead\ *) state="dead:${lv#dead }";;
+    esac
+    token=$(cat "$MARKS/$n.sent" 2>/dev/null || true)
+    done_tok=$(cat "$MARKS/$n.done" 2>/dev/null || true)
+    if [ -z "$token" ]; then turn=none; elif [ "$done_tok" = "$token" ]; then turn=done; else turn=pending; fi
+    log_age=-; lm=$(mtime "$LOG/$n.tty.log")
+    [ -n "$lm" ] && log_age=$(( $(now) - lm ))
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$(get cli)" "$(get id)" "$(get bot)" "$(get dir)" "$state" "$turn" "$log_age"
+  done
   exit 0;;
 esac
 [ $# -ge 1 ] || fail 'missing session name'
@@ -173,6 +187,9 @@ n=$1; shift; valid "$n"
 if [ ! -d "$REG/$n" ]; then
   if [ "$cmd" = wait ]; then
     printf '[cli-session wait] session=%s cli=unknown mode=unknown result=gone elapsed=0s\n' "$n"
+    exit 4
+  elif [ "$cmd" = status ]; then
+    printf '[cli-session status] session=%s cli=unknown mode=unknown result=gone pane=gone rc=- turn=none activity_age=- screen_age=- log_age=- log_bytes=-\n' "$n"
     exit 4
   fi
   fail 'unknown session'
@@ -252,6 +269,72 @@ wait)
   printf '[cli-session wait] session=%s cli=%s mode=%s result=%s elapsed=%ss%s\n' "$n" "$c" "$mode" "$result" "$((SECONDS-begin))" "$extra"
   printf '%s\n' "${screen:-}" | tail -n "$lines"
   exit "$rc";;
+status)
+  stall=300; lines=15; artifact=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --stall) [ $# -ge 2 ] || fail 'missing status option value'; [[ $2 =~ ^[0-9]+$ ]] || fail 'expected a non-negative integer'; stall=$2; shift 2;;
+      --lines) [ $# -ge 2 ] || fail 'missing status option value'; [[ $2 =~ ^[0-9]+$ ]] || fail 'expected a non-negative integer'; lines=$2; shift 2;;
+      --artifact) [ $# -ge 2 ] || fail 'missing status option value'; artifact=$2; shift 2;;
+      *) fail 'unknown status option';;
+    esac
+  done
+  c=$(get cli); mode=idle; case $c in claude|codex) mode=hook;; esac
+  token=$(cat "$MARKS/$n.sent" 2>/dev/null || true)
+  done_tok=$(cat "$MARKS/$n.done" 2>/dev/null || true)
+  if [ -z "$token" ]; then turn=none; elif [ "$done_tok" = "$token" ]; then turn=done; else turn=pending; fi
+  screen=$(tmux capture-pane -p -J -t "=cs-$n:" 2>/dev/null) || {
+    printf '[cli-session status] session=%s cli=%s mode=%s result=gone pane=gone rc=- turn=%s activity_age=- screen_age=- log_age=- log_bytes=-\n' "$n" "$c" "$mode" "$turn"
+    exit 4
+  }
+  sf="$MARKS/$n.screen"; e=$(now)
+  ck=$(printf '%s\n' "$screen" | cksum); sum=${ck%% *}
+  old=$(cat "$sf" 2>/dev/null || true); old_sum=${old%% *}; old_epoch=${old#* }
+  [ "$old" = "$old_epoch" ] && old_epoch=
+  if [ "$sum" != "$old_sum" ]; then
+    tmp=$(mktemp "$MARKS/.screen.XXXXXXXX")
+    printf '%s %s\n' "$sum" "$e" > "$tmp"; mv -f "$tmp" "$sf"
+    screen_age=-
+  else
+    screen_age=$((e-old_epoch))
+  fi
+  logf="$LOG/$n.tty.log"; log_age=-; lm=$(mtime "$logf")
+  [ -n "$lm" ] && log_age=$((e-lm))
+  log_bytes=$(fsize "$logf")
+  activity_age=$screen_age; artifact_age=-; artifact_bytes=-
+  if [ -n "$artifact" ]; then
+    artifact_bytes=$(fsize "$artifact")
+    am=$(mtime "$artifact"); [ -n "$am" ] || am=$(mtime "$MARKS/$n.sent")
+    [ -n "$am" ] && artifact_age=$((e-am))
+    activity_age=$artifact_age
+  else
+    if [ "$log_age" != - ] && { [ "$activity_age" = - ] || [ "$log_age" -lt "$activity_age" ]; }; then activity_age=$log_age; fi
+    if [ "$activity_age" = - ] && [ -n "$token" ]; then
+      sm=$(mtime "$MARKS/$n.sent"); [ -n "$sm" ] && activity_age=$((e-sm))
+    fi
+  fi
+  lv=$(liveness); pane=alive; rc=-; code=2
+  case $lv in
+    gone) result=gone; pane=gone; code=4;;
+    exited\ *) result=exited; rc=${lv#exited }; pane=dead; code=4;;
+    dead\ *) result=dead; rc=${lv#dead }; pane=dead; code=4;;
+  esac
+  if [ "$code" -eq 2 ]; then
+    if [ "$turn" = done ]; then result=done; code=0
+    elif printf '%s\n' "$screen" | tail -n 20 | grep -qiE "$PROMPT_RE"; then result=prompt; code=3
+    elif [ "$turn" = none ]; then result=idle; code=0
+    elif [ "$stall" -gt 0 ] && [ "$activity_age" != - ] && [ "$activity_age" -ge "$stall" ]; then result=stalled; code=5
+    else result=active; code=2
+    fi
+  fi
+  note=
+  if [ "$result" = stalled ] && [ "$mode" = idle ] && ! printf '%s\n' "$screen" | tail -n 12 | grep -qiE "$BUSY_RE"; then note=' note=unproven-completion'; fi
+  extra=
+  [ -n "$artifact" ] && extra=" artifact_age=$artifact_age artifact_bytes=$artifact_bytes"
+  [ -n "$note" ] && extra="$extra$note"
+  printf '[cli-session status] session=%s cli=%s mode=%s result=%s pane=%s rc=%s turn=%s activity_age=%s screen_age=%s log_age=%s log_bytes=%s%s\n' "$n" "$c" "$mode" "$result" "$pane" "$rc" "$turn" "$activity_age" "$screen_age" "$log_age" "$log_bytes" "$extra"
+  [ "$result" != gone ] && printf '%s\n' "$screen" | tail -n "$lines"
+  exit "$code";;
 attach-hint)
   printf 'Attach: tmux attach -t %q\nDetach: Ctrl-b d\n' "cs-$n"
   id=$(get id); c=$(get cli)
