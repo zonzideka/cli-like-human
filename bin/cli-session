@@ -27,13 +27,36 @@ json() {
 }
 alive() { tmux has-session -t "=cs-$n" 2>/dev/null; }
 mark() { CS_NAME=$n CLI_SESSIONS_MARKS_DIR=$MARKS "$HERE/cli-session-mark" "$@"; }
+now() { date +%s; }
+mtime() { stat -c %Y -- "$1" 2>/dev/null || stat -f %m -- "$1" 2>/dev/null || true; }
+fsize() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else printf '%s' '-'; fi; }
+pane_state() {
+  local out dead rc
+  out=$(tmux display-message -p -t "=cs-$n:" '#{pane_dead} #{pane_dead_status}' 2>/dev/null) || { printf 'gone'; return; }
+  [ -n "${out// /}" ] || { printf 'gone'; return; }
+  dead=${out%% *}; rc=${out#* }
+  [ "$rc" = "$out" ] && rc=
+  if [ "$dead" = 1 ]; then [ -n "$rc" ] || rc=-; printf 'dead %s' "$rc"; else printf 'alive'; fi
+}
+liveness() {
+  local ps rc
+  ps=$(pane_state)
+  [ "$ps" != gone ] || { printf 'gone'; return; }
+  if [ -f "$MARKS/$n.exit" ]; then
+    rc=$(cat "$MARKS/$n.exit" 2>/dev/null || true); [ -n "$rc" ] || rc=-
+    printf 'exited %s' "$rc"; return
+  fi
+  case $ps in dead\ *) printf '%s' "$ps";; *) printf 'alive';; esac
+}
+PROMPT_RE='Update now|trust this folder|trust.*directory|Trust and continue|Press Enter to continue|I agree|Choose.*theme|Choose the text style|Do you want to|Allow .*\?|Run this command\?|data.sharing|Help improve'
+BUSY_RE='esc to interrupt|ctrl\+c:cancel|esc to cancel|ctrl\+c to (stop|interrupt)|Working|Thinking|Running|Generating'
 usage() {
   cat <<'HELP'
 Usage: cli-session start [--bot LABEL] [--native-id ID] NAME CLI [DIR] [-- CLI_ARGS...]
        cli-session send NAME TEXT... | send NAME -
        cli-session key NAME KEY...
        cli-session read NAME [LINES]
-       cli-session wait NAME [--timeout SECONDS] [--stable SECONDS] [--lines N]
+       cli-session wait NAME [--timeout SECONDS] [--stable SECONDS] [--lines N] [--stall SECONDS] [--artifact PATH]
        cli-session list | attach-hint NAME | stop NAME
 CLI: claude, codex, grok, agy. stop requests normal exit; it never kills tmux.
 HELP
@@ -114,7 +137,7 @@ start)
   args+=("${extra[@]}")
   put cli "$c"; put dir "$dir"; put id "$id"
   [ -z "$label" ] || put bot "$label"
-  rm -f "$MARKS/$n.sent" "$MARKS/$n.start" "$MARKS/$n.done" "$MARKS/$n.exit"
+  rm -f "$MARKS/$n.sent" "$MARKS/$n.start" "$MARKS/$n.done" "$MARKS/$n.exit" "$MARKS/$n.screen"
   # Persist a quoted launcher, not a transcript or a second native session store.
   launcher=$REG/$n/launch
   {
@@ -170,30 +193,63 @@ send)
 key) [ $# -gt 0 ] || fail 'missing key'; [ ! -f "$MARKS/$n.exit" ] || fail 'CLI has exited'; tmux send-keys -t "=cs-$n:" "$@";;
 read) lines=${1:-60}; number "$lines"; tmux capture-pane -p -J -t "=cs-$n:" -S "-$lines";;
 wait)
-  timeout=3600; stable=6; lines=15
+  timeout=3600; stable=6; lines=15; stall=0; artifact=
   while [ $# -gt 0 ]; do
-    [ $# -ge 2 ] || fail 'missing wait option value'; number "$2"
-    case $1 in --timeout) timeout=$2;; --stable) stable=$2;; --lines) lines=$2;; *) fail 'unknown wait option';; esac; shift 2
+    case $1 in
+      --timeout) [ $# -ge 2 ] || fail 'missing wait option value'; number "$2"; timeout=$2; shift 2;;
+      --stable) [ $# -ge 2 ] || fail 'missing wait option value'; number "$2"; stable=$2; shift 2;;
+      --lines) [ $# -ge 2 ] || fail 'missing wait option value'; number "$2"; lines=$2; shift 2;;
+      --stall) [ $# -ge 2 ] || fail 'missing wait option value'; [[ $2 =~ ^[0-9]+$ ]] || fail 'expected a non-negative integer'; stall=$2; shift 2;;
+      --artifact) [ $# -ge 2 ] || fail 'missing wait option value'; artifact=$2; shift 2;;
+      *) fail 'unknown wait option';;
+    esac
   done
   c=$(get cli); mode=idle; case $c in claude|codex) mode=hook;; esac
   token=$(cat "$MARKS/$n.sent" 2>/dev/null || true)
   started=0; last=; same=0; begin=$SECONDS; rc=2; result=timeout
+  screen_at=$begin; extra=; logf="$LOG/$n.tty.log"; track=0
+  if [ "$stall" -gt 0 ] || [ -n "$artifact" ]; then track=1; fi
   while [ $((SECONDS-begin)) -lt "$timeout" ]; do
     screen=$(tmux capture-pane -p -J -t "=cs-$n:" 2>/dev/null) || { rc=4; result=gone; break; }
     current=$(cat "$MARKS/$n.sent" 2>/dev/null || true)
     [ "$current" = "$token" ] || fail 'another dispatch replaced this turn'
-    if [ -f "$MARKS/$n.exit" ]; then rc=4; result=gone; break; fi
-    if [ -n "$token" ] && [ "$(cat "$MARKS/$n.done" 2>/dev/null || true)" = "$token" ] && [ "$mode" = hook ]; then rc=0; result='done'; break; fi
-    if printf '%s\n' "$screen" | tail -n 20 | grep -qiE 'Update now|trust this folder|trust.*directory|Trust and continue|Press Enter to continue|I agree|Choose.*theme|Choose the text style|Do you want to|Allow .*\?|Run this command\?|data.sharing|Help improve'; then rc=3; result=prompt; break; fi
+    lv=$(liveness)
+    case $lv in
+      gone) rc=4; result=gone; break;;
+      exited\ *) rc=4; result=gone; break;;
+      dead\ *) rc=4; result=dead; break;;
+    esac
+    done_tok=$(cat "$MARKS/$n.done" 2>/dev/null || true)
+    if [ -n "$token" ] && [ "$done_tok" = "$token" ] && [ "$mode" = hook ]; then rc=0; result=done; break; fi
+    if printf '%s\n' "$screen" | tail -n 20 | grep -qiE "$PROMPT_RE"; then rc=3; result=prompt; break; fi
     busy=0
-    printf '%s\n' "$screen" | tail -n 12 | grep -qiE 'esc to interrupt|ctrl\+c:cancel|esc to cancel|ctrl\+c to (stop|interrupt)|Working|Thinking|Running|Generating' && busy=1
+    printf '%s\n' "$screen" | tail -n 12 | grep -qiE "$BUSY_RE" && busy=1
     [ "$busy" = 0 ] || started=1
     if [ "$mode" = idle ] && [ -n "$token" ] && [ "$started" = 1 ] && [ "$busy" = 0 ] && [ "$screen" = "$last" ]; then
-      same=$((same+1)); if [ "$same" -ge "$stable" ]; then rc=0; result='done'; break; fi
+      same=$((same+1))
+      if [ "$same" -ge "$stable" ]; then mark done; rc=0; result=done; break; fi
     else same=0; fi
-    last=$screen; sleep 1
+    if [ "$screen" != "$last" ]; then screen_at=$SECONDS; fi
+    last=$screen
+    if [ "$track" = 1 ]; then
+      screen_age=$((SECONDS-screen_at)); log_age=-
+      lm=$(mtime "$logf"); [ -n "$lm" ] && log_age=$(( $(now) - lm ))
+      activity_age=$screen_age; artifact_age=-; artifact_bytes=-
+      if [ -n "$artifact" ]; then
+        artifact_bytes=$(fsize "$artifact")
+        am=$(mtime "$artifact"); [ -n "$am" ] || am=$(mtime "$MARKS/$n.sent")
+        [ -n "$am" ] && artifact_age=$(( $(now) - am ))
+        activity_age=$artifact_age
+      else
+        if [ "$log_age" != - ] && { [ "$activity_age" = - ] || [ "$log_age" -lt "$activity_age" ]; }; then activity_age=$log_age; fi
+      fi
+      extra=" activity_age=$activity_age screen_age=$screen_age log_age=$log_age log_bytes=$(fsize "$logf")"
+      [ -n "$artifact" ] && extra="$extra artifact_age=$artifact_age artifact_bytes=$artifact_bytes"
+      if [ "$stall" -gt 0 ] && [ "$activity_age" != - ] && [ "$activity_age" -ge "$stall" ]; then rc=5; result=stalled; break; fi
+    fi
+    sleep 1
   done
-  printf '[cli-session wait] session=%s cli=%s mode=%s result=%s elapsed=%ss\n' "$n" "$c" "$mode" "$result" "$((SECONDS-begin))"
+  printf '[cli-session wait] session=%s cli=%s mode=%s result=%s elapsed=%ss%s\n' "$n" "$c" "$mode" "$result" "$((SECONDS-begin))" "$extra"
   printf '%s\n' "${screen:-}" | tail -n "$lines"
   exit "$rc";;
 attach-hint)
